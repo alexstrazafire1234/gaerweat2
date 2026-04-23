@@ -1,10 +1,11 @@
+#!/usr/bin/env python3
 import os
-import httpx
 import logging
+import asyncio
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.error import BadRequest, Conflict
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
+import httpx
 
 # Настройка логирования
 logging.basicConfig(
@@ -13,220 +14,183 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-TELEMT_API = os.environ.get("TELEMT_API_URL", "http://localhost:9091")
-API_TOKEN = os.environ.get("API_TOKEN", "")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API_URL = os.getenv("PROXY_API_URL", "http://gaerweat.railway.internal:9091")
 
-HEADERS = {"Authorization": API_TOKEN} if API_TOKEN else {}
+if not TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not found!")
+    exit(1)
 
-def only_owner(func):
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != OWNER_ID:
-            await update.effective_message.reply_text("⛔ Нет доступа")
-            return
-        return await func(update, ctx)
-    return wrapper
+# --- Функции получения данных ---
 
-async def api_get(path: str):
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{TELEMT_API}{path}", headers=HEADERS)
-        r.raise_for_status()
-        return r.json()
+async def get_stats():
+    """Получает статистику с сервера telemt"""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            # Пытаемся получить общую статистику
+            resp = await client.get(f"{API_URL}/v1/stats/minimal/all")
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(f"Raw stats data: {data}")
+                
+                # Пытаемся извлечь данные из разных возможных форматов
+                active = 0
+                total_conn = 0
+                users_online = 0
+                recv_bytes = 0
+                sent_bytes = 0
+                
+                if isinstance(data, dict):
+                    # Прямые поля
+                    active = data.get('active_connections') or data.get('active') or data.get('current_connections') or data.get('active_now')
+                    total_conn = data.get('total_connections') or data.get('total') or data.get('connections_total')
+                    users_online = data.get('users_online') or data.get('unique_users') or data.get('active_users')
+                    recv_bytes = data.get('bytes_received') or data.get('traffic_in') or data.get('received') or data.get('rx_bytes')
+                    sent_bytes = data.get('bytes_sent') or data.get('traffic_out') or data.get('sent') or data.get('tx_bytes')
+                    
+                    # Если данные вложены в подсловарь
+                    if active is None:
+                        for key in ['stats', 'data', 'result', 'payload']:
+                            if key in data and isinstance(data[key], dict):
+                                sub = data[key]
+                                active = sub.get('active_connections') or sub.get('active') or sub.get('current_connections')
+                                total_conn = sub.get('total_connections') or sub.get('total')
+                                users_online = sub.get('users_online') or sub.get('unique_users')
+                                recv_bytes = sub.get('bytes_received') or sub.get('traffic_in') or sub.get('received')
+                                sent_bytes = sub.get('bytes_sent') or sub.get('traffic_out') or sub.get('sent')
+                                break
+                
+                # Конвертация трафика в человекочитаемый формат
+                def format_traffic(bytes_val):
+                    try:
+                        b = int(bytes_val) if bytes_val is not None else 0
+                        if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+                        if b > 1024**2: return f"{b / (1024**2):.2f} MB"
+                        if b > 1024: return f"{b / 1024:.2f} KB"
+                        return f"{b} B"
+                    except: return "0 B"
 
-def main_keyboard():
-    return InlineKeyboardMarkup([
+                return {
+                    'active': int(active) if active is not None else 0,
+                    'total': int(total_conn) if total_conn is not None else 0,
+                    'users': int(users_online) if users_online is not None else 0,
+                    'recv': format_traffic(recv_bytes),
+                    'sent': format_traffic(sent_bytes),
+                    'total_traffic': format_traffic((int(recv_bytes) if recv_bytes else 0) + (int(sent_bytes) if sent_bytes else 0))
+                }
+            else:
+                logger.warning(f"Stats API error: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            logger.error(f"Error fetching stats: {e}")
+        
+        # Заглушка, если ничего не получилось
+        return {'active': 0, 'total': 0, 'users': 0, 'recv': '0 B', 'sent': '0 B', 'total_traffic': '0 B'}
+
+async def get_active_ips(limit=15):
+    """Получает список активных IP"""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            resp = await client.get(f"{API_URL}/v1/stats/users/active-ips")
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(f"Raw IPs data: {data}")
+                
+                ips = []
+                # Обработка разных форматов ответа
+                if isinstance(data, list):
+                    ips = data
+                elif isinstance(data, dict):
+                    # Ищем список в常见 ключах
+                    for key in ['ips', 'addresses', 'users', 'data', 'active_ips', 'clients', 'peers']:
+                        if key in data:
+                            val = data[key]
+                            if isinstance(val, list):
+                                ips = val
+                                break
+                            elif isinstance(val, dict):
+                                # Если значения словаря - это IP или содержат IP
+                                ips = list(val.keys())
+                                break
+                    # Если сам словарь содержит IP как ключи
+                    if not ips:
+                        ips = list(data.keys())
+                
+                # Фильтрация и ограничение
+                valid_ips = [str(ip) for ip in ips if ip and str(ip).strip()]
+                return valid_ips[:limit]
+        except Exception as e:
+            logger.error(f"Error fetching IPs: {e}")
+    return []
+
+# --- Обработчики команд ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton("🌐 Активные IP", callback_data="active_ips")],
-        [InlineKeyboardButton("❤️ Здоровье", callback_data="health")],
-    ])
-
-@only_owner
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        [InlineKeyboardButton("🌐 Активные IP", callback_data="ips")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "🔒 *MTProxy Monitor*\nВыбери действие:",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        "👋 Привет! Я бот для мониторинга MTProxy.\nВыберите действие:",
+        reply_markup=reply_markup
     )
 
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != OWNER_ID:
-        await query.answer("⛔ Нет доступа", show_alert=True)
-        return
     await query.answer()
-
-    try:
-        if query.data == "stats":
-            resp = await api_get("/v1/stats/minimal/all")
-            d = resp.get("data", {})
-            
-            # Пробуем разные варианты структуры ответа
-            conns = d.get("connections", {})
-            if not conns and isinstance(d, dict):
-                # Если connections нет, ищем поля напрямую в data
-                conns = d
-            
-            traffic = d.get("traffic", {})
-            if not traffic and isinstance(d, dict):
-                traffic = d
-            
-            # Форматируем трафик
-            def format_bytes(bytes_val):
-                if bytes_val is None or bytes_val == '?' or bytes_val == '':
-                    return '?'
-                try:
-                    bytes_val = int(float(bytes_val))
-                    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-                        if bytes_val < 1024:
-                            return f"{bytes_val:.1f} {unit}"
-                        bytes_val /= 1024
-                    return f"{bytes_val:.1f} PB"
-                except (ValueError, TypeError):
-                    return str(bytes_val)
-            
-            # Получаем значения с резервными вариантами
-            current = conns.get('current') or conns.get('active') or conns.get('active_connections') or conns.get('current_connections') or '?'
-            total = conns.get('total') or conns.get('total_connections') or conns.get('connections_total') or '?'
-            users_online = conns.get('users_online') or conns.get('online_users') or conns.get('users') or current
-            
-            bytes_in = traffic.get('bytes_in') or traffic.get('received') or traffic.get('traffic_in') or traffic.get('bytes_received') or '?'
-            bytes_out = traffic.get('bytes_out') or traffic.get('sent') or traffic.get('traffic_out') or traffic.get('bytes_sent') or '?'
-            bytes_total = traffic.get('bytes_total') or traffic.get('total') or traffic.get('total_traffic') or '?'
-            
-            # Если bytes_total нет, считаем сами
-            if bytes_total == '?' and bytes_in != '?' and bytes_out != '?':
-                try:
-                    bytes_total = int(float(bytes_in)) + int(float(bytes_out))
-                except:
-                    pass
-            
-            text = (
-                "📊 *Статистика сервера*\n\n"
-                f"⚡ Активных сейчас: `{current}`\n"
-                f"📈 Всего подключений: `{total}`\n"
-                f"👥 Юзеров онлайн: `{users_online}`\n\n"
-                f"📥 Получено: `{format_bytes(bytes_in)}`\n"
-                f"📤 Отправлено: `{format_bytes(bytes_out)}`\n"
-                f"💾 Всего трафика: `{format_bytes(bytes_total)}`\n"
-                f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-            )
-
-        elif query.data == "active_ips":
-            resp = await api_get("/v1/stats/users/active-ips")
-            # Обрабатываем разные форматы ответа
-            users = []
-            if isinstance(resp, dict):
-                users = resp.get("data", []) or resp.get("users", []) or resp.get("ips", [])
-            elif isinstance(resp, list):
-                users = resp
-            
-            if not users:
-                text = "🌐 *Активные IP*\n\nНет активных подключений"
-            else:
-                lines = ["🌐 *Активные IP*\n"]
-                total_ips = 0
-                
-                # Если ответ плоский список IP
-                if users and isinstance(users[0], str):
-                    total_ips = len(users)
-                    display_count = min(len(users), 15)
-                    for ip in users[:display_count]:
-                        lines.append(f"  • `{ip}`")
-                    if len(users) > 15:
-                        lines.append(f"  ... и ещё {len(users) - 15}")
-                else:
-                    # Если ответ список объектов пользователей
-                    for u in users:
-                        if isinstance(u, dict):
-                            name = u.get("username", u.get("user", u.get("name", "?")))
-                            ips = u.get("ips", u.get("ip", u.get("addresses", [])))
-                            if isinstance(ips, str):
-                                ips = [ips]
-                            if ips:
-                                total_ips += len(ips)
-                                lines.append(f"👤 `{name}` — {len(ips)} устр.:")
-                                # Показываем до 15 IP на пользователя
-                                display_count = min(len(ips), 15)
-                                for ip in ips[:display_count]:
-                                    ip_addr = ip if isinstance(ip, str) else ip.get("ip", ip.get("address", "?"))
-                                    lines.append(f"  • `{ip_addr}`")
-                                if len(ips) > 15:
-                                    lines.append(f"  ... и ещё {len(ips) - 15}")
-                        elif isinstance(u, str):
-                            total_ips += 1
-                            if total_ips <= 15:
-                                lines.append(f"  • `{u}`")
-                
-                if total_ips > 0:
-                    lines.insert(1, f"_Всего активных IP: {total_ips}_\n")
-                text = "\n".join(lines)
-
-        elif query.data == "health":
-            resp = await api_get("/v1/health")
-            d = resp.get("data", {}) if isinstance(resp, dict) else resp
-            if not d:
-                d = resp
-            
-            status = d.get("status", d.get("state", "?"))
-            emoji = "✅" if status in ["ok", "healthy", "up", True] else "❌"
-            
-            # Добавляем дополнительную информацию о здоровье если доступна
-            extra_info = []
-            uptime = d.get("uptime", d.get("up_time"))
-            if uptime:
-                extra_info.append(f"⏱ Аптайм: `{uptime}`")
-            version = d.get("version", d.get("ver"))
-            if version:
-                extra_info.append(f"📦 Версия: `{version}`")
-            
-            extra_text = "\n".join(extra_info) + "\n" if extra_info else ""
-            
-            text = (
-                f"❤️ *Здоровье сервера*\n\n"
-                f"{emoji} Статус: `{status}`\n"
-                f"{extra_text}"
-                f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-            )
-        else:
-            text = "Неизвестная команда"
-
-    except Exception as e:
-        text = f"❌ Ошибка запроса к API:\n`{e}`"
-        logger.error(f"API error: {e}", exc_info=True)
-
-    try:
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=main_keyboard()
+    
+    now = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
+    
+    if query.data == "stats":
+        stats = await get_stats()
+        text = (
+            f"📊 *Статистика сервера*\n\n"
+            f"⚡️ Активных сейчас: `{stats['active']}`\n"
+            f"📈 Всего подключений: `{stats['total']}`\n"
+            f"👥 Юзеров онлайн: `{stats['users']}`\n\n"
+            f"📥 Получено: `{stats['recv']}`\n"
+            f"📤 Отправлено: `{stats['sent']}`\n"
+            f"💾 Всего трафика: `{stats['total_traffic']}`\n\n"
+            f"🕐 {now}"
         )
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            logger.debug("Message content unchanged, skipping edit")
+        keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="stats")]]
+        
+    elif query.data == "ips":
+        ips = await get_active_ips(15)
+        if not ips:
+            text = f"🌐 *Активные IP*\n\nНет активных подключений прямо сейчас.\n\n🕐 {now}"
         else:
-            logger.error(f"BadRequest: {e}")
-    except Conflict as e:
-        logger.warning(f"Conflict error (another instance running?): {e}")
+            ip_list = "\n".join([f"• {ip}" for ip in ips])
+            if len(ips) == 15:
+                ip_list += "\n_... и еще_"
+            text = f"🌐 *Активные IP (до 15)*\n\n{ip_list}\n\n🕐 {now}"
+        keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="ips")]]
+    
+    else:
+        return
+
+    try:
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
-        logger.error(f"Error editing message: {e}", exc_info=True)
+        err_str = str(e)
+        if "not modified" in err_str.lower():
+            pass # Игнорируем ошибку, если контент не изменился
+        else:
+            logger.error(f"Edit message error: {e}")
+            # Фоллбэк: отправляем новое сообщение, если редактирование не удалось
+            try:
+                await query.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+            except:
+                pass
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Добавляем обработчик ошибок
-    async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if isinstance(context.error, Conflict):
-            logger.critical("Бот остановлен: запущен другой инстанс этого бота! Проверьте Railway.")
-        else:
-            logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
-    
-    app.add_error_handler(error_handler)
-    
-    print("Bot started")
+    logger.info("Бот запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
