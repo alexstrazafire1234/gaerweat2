@@ -28,7 +28,7 @@ async def get_stats():
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
             # Пытаемся получить общую статистику
-            resp = await client.get(f"{API_URL}/stats/minimal/all")
+            resp = await client.get(f"{API_URL}/stats/minimal")
             if resp.status_code == 200:
                 data = resp.json()
                 logger.info(f"Raw stats data: {data}")
@@ -104,7 +104,7 @@ async def get_active_ips(limit=15):
     """Получает список активных IP"""
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
-            resp = await client.get(f"{API_URL}/stats/users/active-ips")
+            resp = await client.get(f"{API_URL}/stats/users")
             if resp.status_code == 200:
                 data = resp.json()
                 logger.info(f"Raw IPs data: {data}")
