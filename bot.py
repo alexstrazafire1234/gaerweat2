@@ -14,11 +14,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_URL = os.getenv("PROXY_API_URL", "http://gaerweat.railway.internal:9091")
+TOKEN = os.getenv("BOT_TOKEN")
+API_URL = os.getenv("TELEMT_API_URL", "http://gaerweat.railway.internal:9091")
 
 if not TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN not found!")
+    logger.error("BOT_TOKEN not found! Проверьте переменные окружения на Railway.")
     exit(1)
 
 # --- Функции получения данных ---
