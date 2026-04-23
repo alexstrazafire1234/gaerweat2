@@ -208,7 +208,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     
     logger.info("Бот запущен...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True ensures that if another instance was running,
+    # it gets terminated and pending updates are cleared to avoid conflicts
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
