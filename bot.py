@@ -60,15 +60,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if query.data == "stats":
             resp = await api_get("/v1/stats/minimal/all")
             d = resp.get("data", {})
+            
+            # Пробуем разные варианты структуры ответа
             conns = d.get("connections", {})
+            if not conns and isinstance(d, dict):
+                # Если connections нет, ищем поля напрямую в data
+                conns = d
+            
             traffic = d.get("traffic", {})
+            if not traffic and isinstance(d, dict):
+                traffic = d
             
             # Форматируем трафик
             def format_bytes(bytes_val):
-                if bytes_val is None or bytes_val == '?':
+                if bytes_val is None or bytes_val == '?' or bytes_val == '':
                     return '?'
                 try:
-                    bytes_val = int(bytes_val)
+                    bytes_val = int(float(bytes_val))
                     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
                         if bytes_val < 1024:
                             return f"{bytes_val:.1f} {unit}"
@@ -77,53 +85,100 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except (ValueError, TypeError):
                     return str(bytes_val)
             
+            # Получаем значения с резервными вариантами
+            current = conns.get('current') or conns.get('active') or conns.get('active_connections') or conns.get('current_connections') or '?'
+            total = conns.get('total') or conns.get('total_connections') or conns.get('connections_total') or '?'
+            users_online = conns.get('users_online') or conns.get('online_users') or conns.get('users') or current
+            
+            bytes_in = traffic.get('bytes_in') or traffic.get('received') or traffic.get('traffic_in') or traffic.get('bytes_received') or '?'
+            bytes_out = traffic.get('bytes_out') or traffic.get('sent') or traffic.get('traffic_out') or traffic.get('bytes_sent') or '?'
+            bytes_total = traffic.get('bytes_total') or traffic.get('total') or traffic.get('total_traffic') or '?'
+            
+            # Если bytes_total нет, считаем сами
+            if bytes_total == '?' and bytes_in != '?' and bytes_out != '?':
+                try:
+                    bytes_total = int(float(bytes_in)) + int(float(bytes_out))
+                except:
+                    pass
+            
             text = (
                 "📊 *Статистика сервера*\n\n"
-                f"⚡ Активных сейчас: `{conns.get('current', '?')}`\n"
-                f"📈 Всего подключений: `{conns.get('total', '?')}`\n"
-                f"👥 Юзеров онлайн: `{conns.get('users_online', '?')}`\n\n"
-                f"📥 Получено: `{format_bytes(traffic.get('bytes_in', '?'))}`\n"
-                f"📤 Отправлено: `{format_bytes(traffic.get('bytes_out', '?'))}`\n"
-                f"💾 Всего трафика: `{format_bytes(traffic.get('bytes_total', '?'))}`\n"
+                f"⚡ Активных сейчас: `{current}`\n"
+                f"📈 Всего подключений: `{total}`\n"
+                f"👥 Юзеров онлайн: `{users_online}`\n\n"
+                f"📥 Получено: `{format_bytes(bytes_in)}`\n"
+                f"📤 Отправлено: `{format_bytes(bytes_out)}`\n"
+                f"💾 Всего трафика: `{format_bytes(bytes_total)}`\n"
                 f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
             )
 
         elif query.data == "active_ips":
             resp = await api_get("/v1/stats/users/active-ips")
-            users = resp.get("data", [])
+            # Обрабатываем разные форматы ответа
+            users = []
+            if isinstance(resp, dict):
+                users = resp.get("data", []) or resp.get("users", []) or resp.get("ips", [])
+            elif isinstance(resp, list):
+                users = resp
+            
             if not users:
                 text = "🌐 *Активные IP*\n\nНет активных подключений"
             else:
                 lines = ["🌐 *Активные IP*\n"]
                 total_ips = 0
-                for u in users:
-                    name = u.get("username", "?")
-                    ips = u.get("ips", [])
-                    if ips:
-                        total_ips += len(ips)
-                        lines.append(f"👤 `{name}` — {len(ips)} устр.:")
-                        # Показываем до 15 IP на пользователя
-                        display_count = min(len(ips), 15)
-                        for ip in ips[:display_count]:
-                            lines.append(f"  • `{ip}`")
-                        if len(ips) > 15:
-                            lines.append(f"  ... и ещё {len(ips) - 15}")
                 
-                lines.insert(1, f"_Всего активных IP: {total_ips}_\n")
+                # Если ответ плоский список IP
+                if users and isinstance(users[0], str):
+                    total_ips = len(users)
+                    display_count = min(len(users), 15)
+                    for ip in users[:display_count]:
+                        lines.append(f"  • `{ip}`")
+                    if len(users) > 15:
+                        lines.append(f"  ... и ещё {len(users) - 15}")
+                else:
+                    # Если ответ список объектов пользователей
+                    for u in users:
+                        if isinstance(u, dict):
+                            name = u.get("username", u.get("user", u.get("name", "?")))
+                            ips = u.get("ips", u.get("ip", u.get("addresses", [])))
+                            if isinstance(ips, str):
+                                ips = [ips]
+                            if ips:
+                                total_ips += len(ips)
+                                lines.append(f"👤 `{name}` — {len(ips)} устр.:")
+                                # Показываем до 15 IP на пользователя
+                                display_count = min(len(ips), 15)
+                                for ip in ips[:display_count]:
+                                    ip_addr = ip if isinstance(ip, str) else ip.get("ip", ip.get("address", "?"))
+                                    lines.append(f"  • `{ip_addr}`")
+                                if len(ips) > 15:
+                                    lines.append(f"  ... и ещё {len(ips) - 15}")
+                        elif isinstance(u, str):
+                            total_ips += 1
+                            if total_ips <= 15:
+                                lines.append(f"  • `{u}`")
+                
+                if total_ips > 0:
+                    lines.insert(1, f"_Всего активных IP: {total_ips}_\n")
                 text = "\n".join(lines)
 
         elif query.data == "health":
             resp = await api_get("/v1/health")
-            d = resp.get("data", {})
-            status = d.get("status", "?")
-            emoji = "✅" if status == "ok" else "❌"
+            d = resp.get("data", {}) if isinstance(resp, dict) else resp
+            if not d:
+                d = resp
+            
+            status = d.get("status", d.get("state", "?"))
+            emoji = "✅" if status in ["ok", "healthy", "up", True] else "❌"
             
             # Добавляем дополнительную информацию о здоровье если доступна
             extra_info = []
-            if "uptime" in d:
-                extra_info.append(f"⏱ Аптайм: `{d['uptime']}`")
-            if "version" in d:
-                extra_info.append(f"📦 Версия: `{d['version']}`")
+            uptime = d.get("uptime", d.get("up_time"))
+            if uptime:
+                extra_info.append(f"⏱ Аптайм: `{uptime}`")
+            version = d.get("version", d.get("ver"))
+            if version:
+                extra_info.append(f"📦 Версия: `{version}`")
             
             extra_text = "\n".join(extra_info) + "\n" if extra_info else ""
             
