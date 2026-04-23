@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # Настройка логирования
 logging.basicConfig(
@@ -102,10 +102,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if ips:
                         total_ips += len(ips)
                         lines.append(f"👤 `{name}` — {len(ips)} устр.:")
-                        for ip in ips[:5]:  # Показываем максимум 5 IP на пользователя
+                        # Показываем до 15 IP на пользователя
+                        display_count = min(len(ips), 15)
+                        for ip in ips[:display_count]:
                             lines.append(f"  • `{ip}`")
-                        if len(ips) > 5:
-                            lines.append(f"  ... и ещё {len(ips) - 5}")
+                        if len(ips) > 15:
+                            lines.append(f"  ... и ещё {len(ips) - 15}")
                 
                 lines.insert(1, f"_Всего активных IP: {total_ips}_\n")
                 text = "\n".join(lines)
@@ -149,6 +151,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.debug("Message content unchanged, skipping edit")
         else:
             logger.error(f"BadRequest: {e}")
+    except Conflict as e:
+        logger.warning(f"Conflict error (another instance running?): {e}")
     except Exception as e:
         logger.error(f"Error editing message: {e}", exc_info=True)
 
@@ -159,7 +163,10 @@ def main():
     
     # Добавляем обработчик ошибок
     async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
+        if isinstance(context.error, Conflict):
+            logger.critical("Бот остановлен: запущен другой инстанс этого бота! Проверьте Railway.")
+        else:
+            logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
     
     app.add_error_handler(error_handler)
     
