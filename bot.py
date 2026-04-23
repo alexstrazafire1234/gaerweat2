@@ -28,10 +28,14 @@ async def get_stats():
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
             # Пытаемся получить общую статистику
-            resp = await client.get(f"{API_URL}/v1/stats/minimal/all")
+            resp = await client.get(f"{API_URL}/stats/minimal/all")
             if resp.status_code == 200:
                 data = resp.json()
                 logger.info(f"Raw stats data: {data}")
+                
+                # Обработка структуры: {'ok': True, 'data': {...}}
+                if isinstance(data, dict) and data.get('ok'):
+                    data = data.get('data', data)
                 
                 # Пытаемся извлечь данные из разных возможных форматов
                 active = 0
@@ -48,9 +52,19 @@ async def get_stats():
                     recv_bytes = data.get('bytes_received') or data.get('traffic_in') or data.get('received') or data.get('rx_bytes')
                     sent_bytes = data.get('bytes_sent') or data.get('traffic_out') or data.get('sent') or data.get('tx_bytes')
                     
-                    # Если данные вложены в подсловарь
+                    # Если данные вложены в подсловарь 'data' (структура telemt)
+                    if active is None and 'data' in data:
+                        sub = data['data']
+                        if isinstance(sub, dict):
+                            active = sub.get('active_connections') or sub.get('active') or sub.get('current_connections')
+                            total_conn = sub.get('total_connections') or sub.get('total')
+                            users_online = sub.get('users_online') or sub.get('unique_users')
+                            recv_bytes = sub.get('bytes_received') or sub.get('traffic_in') or sub.get('received')
+                            sent_bytes = sub.get('bytes_sent') or sub.get('traffic_out') or sub.get('sent')
+                    
+                    # Если данные вложены в другие ключи
                     if active is None:
-                        for key in ['stats', 'data', 'result', 'payload']:
+                        for key in ['stats', 'result', 'payload']:
                             if key in data and isinstance(data[key], dict):
                                 sub = data[key]
                                 active = sub.get('active_connections') or sub.get('active') or sub.get('current_connections')
@@ -90,12 +104,16 @@ async def get_active_ips(limit=15):
     """Получает список активных IP"""
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
-            resp = await client.get(f"{API_URL}/v1/stats/users/active-ips")
+            resp = await client.get(f"{API_URL}/stats/users/active-ips")
             if resp.status_code == 200:
                 data = resp.json()
                 logger.info(f"Raw IPs data: {data}")
                 
                 ips = []
+                # Обработка структуры: {'ok': True, 'data': [...]}
+                if isinstance(data, dict) and data.get('ok'):
+                    data = data.get('data', data)
+                
                 # Обработка разных форматов ответа
                 if isinstance(data, list):
                     ips = data
