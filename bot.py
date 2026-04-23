@@ -1,8 +1,17 @@
 import os
 import httpx
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import BadRequest
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
@@ -52,12 +61,31 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             resp = await api_get("/v1/stats/minimal/all")
             d = resp.get("data", {})
             conns = d.get("connections", {})
+            traffic = d.get("traffic", {})
+            
+            # Форматируем трафик
+            def format_bytes(bytes_val):
+                if bytes_val is None or bytes_val == '?':
+                    return '?'
+                try:
+                    bytes_val = int(bytes_val)
+                    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                        if bytes_val < 1024:
+                            return f"{bytes_val:.1f} {unit}"
+                        bytes_val /= 1024
+                    return f"{bytes_val:.1f} PB"
+                except (ValueError, TypeError):
+                    return str(bytes_val)
+            
             text = (
-                "📊 *Статистика*\n\n"
+                "📊 *Статистика сервера*\n\n"
                 f"⚡ Активных сейчас: `{conns.get('current', '?')}`\n"
-                f"📈 Всего за всё время: `{conns.get('total', '?')}`\n"
-                f"👥 Юзеров онлайн: `{conns.get('users_online', '?')}`\n"
-                f"\n🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                f"📈 Всего подключений: `{conns.get('total', '?')}`\n"
+                f"👥 Юзеров онлайн: `{conns.get('users_online', '?')}`\n\n"
+                f"📥 Получено: `{format_bytes(traffic.get('bytes_in', '?'))}`\n"
+                f"📤 Отправлено: `{format_bytes(traffic.get('bytes_out', '?'))}`\n"
+                f"💾 Всего трафика: `{format_bytes(traffic.get('bytes_total', '?'))}`\n"
+                f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
             )
 
         elif query.data == "active_ips":
@@ -67,12 +95,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 text = "🌐 *Активные IP*\n\nНет активных подключений"
             else:
                 lines = ["🌐 *Активные IP*\n"]
+                total_ips = 0
                 for u in users:
                     name = u.get("username", "?")
                     ips = u.get("ips", [])
-                    lines.append(f"👤 `{name}` — {len(ips)} устр.:")
-                    for ip in ips:
-                        lines.append(f"  • `{ip}`")
+                    if ips:
+                        total_ips += len(ips)
+                        lines.append(f"👤 `{name}` — {len(ips)} устр.:")
+                        for ip in ips[:5]:  # Показываем максимум 5 IP на пользователя
+                            lines.append(f"  • `{ip}`")
+                        if len(ips) > 5:
+                            lines.append(f"  ... и ещё {len(ips) - 5}")
+                
+                lines.insert(1, f"_Всего активных IP: {total_ips}_\n")
                 text = "\n".join(lines)
 
         elif query.data == "health":
@@ -80,29 +115,56 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             d = resp.get("data", {})
             status = d.get("status", "?")
             emoji = "✅" if status == "ok" else "❌"
+            
+            # Добавляем дополнительную информацию о здоровье если доступна
+            extra_info = []
+            if "uptime" in d:
+                extra_info.append(f"⏱ Аптайм: `{d['uptime']}`")
+            if "version" in d:
+                extra_info.append(f"📦 Версия: `{d['version']}`")
+            
+            extra_text = "\n".join(extra_info) + "\n" if extra_info else ""
+            
             text = (
                 f"❤️ *Здоровье сервера*\n\n"
                 f"{emoji} Статус: `{status}`\n"
-                f"\n🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                f"{extra_text}"
+                f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
             )
         else:
             text = "Неизвестная команда"
 
     except Exception as e:
         text = f"❌ Ошибка запроса к API:\n`{e}`"
+        logger.error(f"API error: {e}", exc_info=True)
 
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_keyboard()
+        )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            logger.debug("Message content unchanged, skipping edit")
+        else:
+            logger.error(f"BadRequest: {e}")
+    except Exception as e:
+        logger.error(f"Error editing message: {e}", exc_info=True)
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Добавляем обработчик ошибок
+    async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
+    
+    app.add_error_handler(error_handler)
+    
     print("Bot started")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
